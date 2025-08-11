@@ -92,36 +92,62 @@ class LMF2Cfg:
         semantic_id = 0
         per_link_semantic = False
 
+        # ------------------------------------ ORIGINAL ---------------------------------------
+
+        # min_state_ratio = [
+        #     0.1,
+        #     0.1,
+        #     0.1,
+        #     0,
+        #     0,
+        #     -np.pi,
+        #     1.0,
+        #     0,
+        #     0,
+        #     0,
+        #     0,
+        #     0,
+        #     0,
+        # ]  # [ratio_x, ratio_y, ratio_z, roll_rad, pitch_rad, yaw_rad, 1.0, vx, vy, vz, wx, wy, wz]
+        # max_state_ratio = [
+        #     0.9,
+        #     0.9,
+        #     0.9,
+        #     0,
+        #     0,
+        #     np.pi,
+        #     1.0,
+        #     0,
+        #     0,
+        #     0,
+        #     0,
+        #     0,
+        #     0,
+        # ]  # [ratio_x, ratio_y, ratio_z, roll_rad, pitch_rad, yaw_rad, 1.0, vx, vy, vz, wx, wy, wz]
+
+        # ------------------------------ END ORIGINAL -----------------------------------------
+
+        # ------------------------------ EDIT INITIALIZATION INDOOR ENV ------------------------------
+            # center x,y (0.5, 0.5), z at 1.2m -> ratio 0.4 when bounds are 0..3m
         min_state_ratio = [
-            0.1,
-            0.1,
-            0.1,
-            0,
-            0,
-            -np.pi,
-            1.0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ]  # [ratio_x, ratio_y, ratio_z, roll_rad, pitch_rad, yaw_rad, 1.0, vx, vy, vz, wx, wy, wz]
+            0.5, 0.5, 0.4,   # x_ratio, y_ratio, z_ratio
+            0.0, 0.0, 0.0,   # roll, pitch, yaw (rad)
+            1.0,             # scale
+            0.0, 0.0, 0.0,   # vx, vy, vz
+            0.0, 0.0, 0.0    # wx, wy, wz
+        ]
         max_state_ratio = [
-            0.9,
-            0.9,
-            0.9,
-            0,
-            0,
-            np.pi,
+            0.5, 0.5, 0.4,   # same as min => fixed spawn
+            0.0, 0.0, 0.0,
             1.0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-        ]  # [ratio_x, ratio_y, ratio_z, roll_rad, pitch_rad, yaw_rad, 1.0, vx, vy, vz, wx, wy, wz]
+            0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0
+        ]
+        min_state_ratio[0:2] = [0.47, 0.47]
+        max_state_ratio[0:2] = [0.53, 0.53]
+        # keep [2] = 0.4 in both
+
+        # --------------------------------------------------------------------------------------------
 
         max_force_and_torque_disturbance = [
             0.1,

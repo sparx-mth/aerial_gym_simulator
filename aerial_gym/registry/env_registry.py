@@ -1,3 +1,5 @@
+from aerial_gym.config.env_config.simple_house_env_config import SimpleHouseEnvCfg
+
 class EnvConfigRegistry:
     """
     This class is used to keep track of the environment classes that are registered.
@@ -36,3 +38,5 @@ class EnvConfigRegistry:
 
 # create a global env registry
 env_config_registry = EnvConfigRegistry()
+# Register our new env
+env_config_registry.register("simple_house_env", SimpleHouseEnvCfg)

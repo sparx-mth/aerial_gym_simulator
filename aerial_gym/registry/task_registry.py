@@ -1,3 +1,5 @@
+import aerial_gym.config.task_config.custom_slam_task_config as custom_slam_task_config
+from aerial_gym.task.custom_task.custom_slam_task import CustomTask
 class TaskRegistry:
     def __init__(self):
         self.task_class_registry = {}
@@ -31,3 +33,12 @@ class TaskRegistry:
 
 
 task_registry = TaskRegistry()
+ 
+
+task_registry.register_task(
+    "custom_slam_task",
+    CustomTask,
+    custom_slam_task_config.task_config
+)
+
+

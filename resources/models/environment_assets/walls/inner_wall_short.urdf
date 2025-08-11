@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<robot name="inner_wall_short">
+  <link name="base_link">
+    <inertial>
+      <mass value="0.6"/>
+      <origin xyz="0 0 0"/>
+      <inertia ixx="0.5" ixy="0" ixz="0" iyy="0.5" iyz="0" izz="0.5"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 1.5"/>
+      <geometry>
+        <box size="2.5 0.2 3.0"/>
+      </geometry>
+      <material name="gray"><color rgba="0.7 0.7 0.7 1.0"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 1.5"/>
+      <geometry>
+        <box size="2.5 0.2 3.0"/>
+      </geometry>
+    </collision>
+  </link>
+</robot>

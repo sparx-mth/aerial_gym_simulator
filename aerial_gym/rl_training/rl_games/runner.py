@@ -145,6 +145,15 @@ env_configurations.register(
     },
 )
 
+env_configurations.register(
+    "custom_slam_task",
+    {
+        "env_creator": lambda **kwargs: task_registry.make_task("custom_slam_task", **kwargs),
+        "vecenv_type": "AERIAL-RLGPU",
+    },
+)
+
+
 vecenv.register(
     "AERIAL-RLGPU",
     lambda config_name, num_actors, **kwargs: AERIALRLGPUEnv(config_name, num_actors, **kwargs),
