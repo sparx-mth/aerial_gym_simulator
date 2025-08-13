@@ -28,15 +28,16 @@ class CustomTask(BaseTask):
         if rm is not None and hasattr(rm, "actions"):
             self.agent_count = rm.actions.shape[0]
         else:
-            self.agent_count = getattr(self.task_config, "agent_count", 3)
+            self.agent_count = getattr(self.task_config, "agent_count", 256)
         self.num_envs = self.sim_env.num_envs
         # self.agent_count = self.task_config.agent_count  # expected: 3–5
         # self.coverage_maps = torch.zeros((self.num_envs, self.agent_count, 100, 100), device=self.device)
-
+        self.params = self.task_config.reward_parameters
         # compute obs dim from agent_count
         obs_dim = self.agent_count * (7 + 6 + 6)  # 19 per agent
         self.task_config.observation_space_dim = obs_dim
         self.coverage_maps = torch.zeros((self.num_envs, self.agent_count, 100, 100), device=self.device)
+        self.prev_coverage_maps = torch.zeros_like(self.coverage_maps)
         priv_dim = self.task_config.privileged_observation_space_dim
 
         self.action_space = Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float32)  # 6D continuous action
@@ -90,6 +91,7 @@ class CustomTask(BaseTask):
         else:
             actions = actions.to(self.device).float()
 
+
         # map 6->4
         env_actions = actions[..., :4]
 
@@ -137,7 +139,6 @@ class CustomTask(BaseTask):
         #     ids = torch.nonzero(done_mask, as_tuple=False).squeeze(-1)
         #     self.reset_idx(ids)
         #     self._steps[ids] = 0
-
 
         return self.task_obs, rewards_env, terminated, truncated, {}
 
@@ -431,7 +432,6 @@ class CustomTask(BaseTask):
                 if c.shape[0] == N:
                     collisions_env = c.view(N, 1)
                 elif c.shape[0] == A:
-                    # per-agent -> any collision per env
                     collisions_env = (c.view(1, A) > 0).any(dim=1, keepdim=True).float().repeat(N, 1)
                 else:
                     collisions_env = torch.zeros((N, 1), device=self.device)
@@ -441,28 +441,66 @@ class CustomTask(BaseTask):
                 collisions_env = torch.zeros((N, 1), device=self.device)
 
         # 2) exploration -> (N,1)
-        # coverage_maps: (N, A, H, W) -> any agent explored (N,H,W)
         explored_any = (self.coverage_maps > 0).any(dim=1).float()              # (N,H,W)
         explored_frac = explored_any.mean(dim=(1, 2)).unsqueeze(1)              # (N,1)
 
+        # Track newly explored cells this step
+        newly_explored = ((self.coverage_maps - self.prev_coverage_maps) > 0).float()
+        newly_explored_frac = newly_explored.mean(dim=(1, 2)).unsqueeze(1)
+
+        r_explore = self.params["new_area_reward"] * newly_explored_frac
+
+        # Store current as previous for next step
+        self.prev_coverage_maps = self.coverage_maps.clone()
+
+        # Terminal reward: all coverage above threshold
+        coverage_ratio = explored_frac  # from before
+        done_coverage = (coverage_ratio > self.params["coverage_completion_threshold"]).float()
+        r_completion = done_coverage * self.params["completion_bonus"]
+
+        if coverage_ratio.mean() > 0.2:
+            print(f"[DEBUG] [CustomTask] Coverage ratio: {coverage_ratio.mean().item():.2f} (threshold: {self.params['coverage_completion_threshold']})")
+
+
+
         # 3) update altitude proxy
         vz_env = self._get_commanded_vz_envwise()           # (N,1) in policy units
-        # if you scaled actions to m/s already, great; else assume [-1,1] maps to ~1 m/s:
         vz_mps = vz_env * 1.0
         self._est_z = torch.clamp(self._est_z + vz_mps * self._dt, 0.0, self._z_max)
 
-        # 4) altitude shaping around 1.5 m
-        r_alt = -torch.abs(self._est_z - self._z_ref)       # (N,1)
+        # 4) altitude shaping: reward if within [0.3, 2.7] m, penalize otherwise
+        in_range = ((self._est_z >= 0.3) & (self._est_z <= 2.7)).float()
+        r_alt = in_range * 1.0 + (~in_range.bool()).float() * -1.0  # +1 if in range, -1 if out
 
-        # 5) anti-fall from commands (helps early learning)
+        # 5) encourage linear velocity (average |vx,vy,vz| per env)
+        # Get velocities from sim state
+        pose, vel, imu = self._extract_state_from_sim()
+        lin_vel = vel[..., :3]  # (N, A, 3)
+        lin_vel_mag = torch.norm(lin_vel, dim=-1)  # (N, A)
+        avg_lin_vel = lin_vel_mag.mean(dim=1, keepdim=True)  # (N, 1)
+        r_vel = avg_lin_vel  # scale as needed, e.g. *1.0
+
+        # 6) anti-fall from commands (helps early learning)
         up_bonus = torch.relu(vz_env)
         down_pen = torch.relu(-vz_env)
         anti_fall = 0.5 * up_bonus - 1.0 * down_pen
-        # 6) compose env-level reward (N,1)
-        reward = 10.0 * explored_frac - 5.0 * collisions_env + 0.5 * r_alt + anti_fall
-        reward = torch.nan_to_num(reward, nan=0.0, posinf=0.0, neginf=0.0)                   # (N,1)
 
-        # 7) write back
+        # 7) compose env-level reward (N,1)
+        
+    
+        reward = (
+                    r_explore
+                    + r_completion
+                    - 5.0 * collisions_env
+                    + r_alt
+                    + anti_fall
+                    + 1.0 * r_vel
+                )
+
+        reward = reward.sum(dim=(1, 2), keepdim=True)
+        reward = reward.view(self.num_envs, 1) 
+
+        # 8) write back
         self.task_obs["collisions"].copy_(collisions_env)  # (N,1)
         self.task_obs["rewards"].copy_(reward)             # (N,1)
 

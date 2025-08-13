@@ -313,7 +313,7 @@ if __name__ == "__main__":
         config = yaml.safe_load(stream)
 
         config = update_config(config, args)
-
+        print(f"[Debug] config[headless]: {config['params']['config']['env_config']['headless']}")
         from rl_games.torch_runner import Runner
 
         runner = Runner()

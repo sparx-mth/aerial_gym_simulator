@@ -9,7 +9,7 @@ params:
     env_name: custom_slam_task              # must match your task_registry key
     env_config:
       num_envs: 3                         # overridden by --num_envs
-      headless: True                        # overridden by --headless
+      headless: True                   # overridden by --headless
       use_warp: True                        # overridden by --use_warp
     name: custom_slam_experiment
 
@@ -32,7 +32,7 @@ params:
     clip_value: False
     num_actors: 3                         # keep in sync with env_config.num_envs
     horizon_length: 64
-    minibatch_size: 192
+    minibatch_size: 256
     mini_epochs: 4
     critic_coef: 2
     normalize_input: True
@@ -58,6 +58,13 @@ params:
     name: continuous_a2c_logstd
 
   load_checkpoint: False
+
+  # Viewer
+  viewer:
+    name: default
+    headless: True
+    use_warp: True
+    render_mode: "human"  # or "rgb_array" for video capture
 
   # Policy/critic network
   network:

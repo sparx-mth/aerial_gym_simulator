@@ -422,6 +422,7 @@ class IsaacGymEnv(BaseManager):
     def create_viewer(self, env_manager):
         self.robot_handles = [ah[0] for ah in self.asset_handles]
         logger.warning(f"Headless: {self.sim_config.viewer.headless}")
+        logger.info(f"[Debug] Sim Config = {self.sim_config}")
         if not self.sim_config.viewer.headless:
             logger.info("Creating viewer")
             self.viewer = IGEViewerControl(

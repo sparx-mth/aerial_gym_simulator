@@ -165,3 +165,36 @@ The task already checks for `sim_env.actor_root_state_tensor` and will use it au
 ## License / attribution
 
 Follows the original repository’s license for all existing code/assets. The added files here are simple configuration/URDF snippets intended for use within that project.
+
+### ✅ Required Fixes Before Training
+
+#### 1. 🧩 Fix Argument Parser in Isaac Gym (`gymutil.py`)
+
+Before training with `aerial_gym_simulator`, modify **line 337** in the `gymutil.py` script of Isaac Gym:
+
+📄 `isaacgym/python/isaacgym/gymutil.py`
+```diff
+- args = parser.parse_args()
++ args, _ = parser.parse_known_args()
+```
+
+🎯 This prevents argument clashes when passing CLI flags for other libraries like `rl_games`.
+
+---
+
+#### 2. 🧩 libstdc++ Fix for CUDA Compatibility (esp. CUDA 12.4 / 4090)
+
+If you encounter errors like:
+```
+libstdc++.so.6: version `GLIBCXX_3.4.32' not found
+```
+
+💡 Install updated C++ runtime from conda-forge:
+```bash
+conda install -c conda-forge libstdcxx-ng
+```
+
+You can also prepend the newer version to your environment:
+```bash
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+```
