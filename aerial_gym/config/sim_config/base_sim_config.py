@@ -1,7 +1,7 @@
 class BaseSimConfig:
     # viewer camera:
     class viewer:
-        headless = True
+        headless = True 
         ref_env = 0
         camera_position = [-5, -5, 4]  # [m]
         lookat = [0, 0, 0]  # [m]

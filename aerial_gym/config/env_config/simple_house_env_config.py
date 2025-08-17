@@ -5,7 +5,7 @@ import numpy as np
 class SimpleHouseEnvCfg(EnvObjectConfig):
     class env:
         # how many parallel envs to spawn
-        num_envs = 32
+        num_envs = 3
         # number of "environment actions" (optional; leave 0 if not using runtime dynamics yet)
         num_env_actions = 0
 

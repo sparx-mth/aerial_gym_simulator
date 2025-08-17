@@ -2,165 +2,501 @@ from aerial_gym.task.base_task import BaseTask
 from aerial_gym.sim.sim_builder import SimBuilder
 import torch
 import numpy as np
+import os
+import math
+
 
 from aerial_gym.utils.logging import CustomLogger
+from aerial_gym.utils.custom_metrics import SlamMetrics
 from gym.spaces import Dict, Box
 from typing import Dict as TypingDict
+from aerial_gym.utils.math import quat_rotate_inverse 
+
 
 logger = CustomLogger("multiagent_slam_task")
 
 
 class CustomTask(BaseTask):
-    def __init__(self, task_config, **kwargs):
+    def __init__(self, task_config, seed=None, num_envs=None, headless=None, device=None, use_warp=None, **kwargs):
+        # === pass-through overrides (same as NavigationTask) ===
+        if seed is not None:
+            task_config.seed = seed
+        if num_envs is not None:
+            task_config.num_envs = num_envs
+        if headless is not None:
+            task_config.headless = headless
+        if device is not None:
+            task_config.device = device
+        if use_warp is not None:
+            task_config.use_warp = use_warp
+
         super().__init__(task_config)
         self.device = self.task_config.device
 
+        # === build env exactly like NavigationTask ===
         self.sim_env = SimBuilder().build_env(
             sim_name=self.task_config.sim_name,
             env_name=self.task_config.env_name,
             robot_name=self.task_config.robot_name,
-            controller_name=self.task_config.controller_name, 
-            device=self.device,
+            controller_name=self.task_config.controller_name,
             args=self.task_config.args,
+            device=self.device,
+            num_envs=self.task_config.num_envs,
+            use_warp=self.task_config.use_warp,
+            headless=self.task_config.headless,
+        )
+        self.num_envs = self.sim_env.num_envs
+
+        # Pull the in-place observation dict from the env (NavigationTask pattern)
+        self.obs_dict = self.sim_env.get_obs()
+        if not getattr(self, "_printed_obs_keys", False):
+            try:
+                ks = list(self.obs_dict.keys())
+                print("[CustomTask] obs_dict keys:", ks)
+            except Exception:
+                pass
+            self._printed_obs_keys = True
+
+        # If the env already exposes crashes/truncations, reuse them; else allocate
+        self.terminations = self.obs_dict.get(
+            "crashes",
+            torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        )
+        self.truncations = self.obs_dict.get(
+            "truncations",
+            torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        )
+        self.rewards = torch.zeros(self.num_envs, device=self.device)
+
+        # === action / observation spaces ===
+        self.action_space = Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float32)
+        self.action_transformation_function = getattr(
+            self.task_config, "action_transformation_function", self._default_action_tf
         )
 
-        rm = getattr(self.sim_env, "robot_manager", None)
-        if rm is not None and hasattr(rm, "actions"):
-            self.agent_count = rm.actions.shape[0]
-        else:
-            self.agent_count = getattr(self.task_config, "agent_count", 256)
-        self.num_envs = self.sim_env.num_envs
-        # self.agent_count = self.task_config.agent_count  # expected: 3–5
-        # self.coverage_maps = torch.zeros((self.num_envs, self.agent_count, 100, 100), device=self.device)
-        self.params = self.task_config.reward_parameters
-        # compute obs dim from agent_count
-        obs_dim = self.agent_count * (7 + 6 + 6)  # 19 per agent
-        self.task_config.observation_space_dim = obs_dim
-        self.coverage_maps = torch.zeros((self.num_envs, self.agent_count, 100, 100), device=self.device)
-        self.prev_coverage_maps = torch.zeros_like(self.coverage_maps)
-        priv_dim = self.task_config.privileged_observation_space_dim
-
-        self.action_space = Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float32)  # 6D continuous action
-
-        self._steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        self._warmup_len = 50                   # steps
-        self._takeoff_vz = 0.8                  # m/s up during warmup
-
-        self._dt = getattr(self.task_config, "sim_dt", 1.0/60.0)  # override in config if you know it
-        self._z_ref = 1.5
-        self._z_max = 5.0
-        self._est_z = torch.zeros(self.num_envs, 1, device=self.device)  # env-level; or (num_envs, agent_count) if you want per-agent
-
+        # If the env exposes single-robot fields like NavigationTask, we can build obs directly.
+        # If not, we’ll fall back to your root-state extractor (_extract_state_from_sim()).
+        obs_dim = getattr(self.task_config, "observation_space_dim", None)
+        if obs_dim is None:
+            # default to 19 per agent * agent_count; you already compute this elsewhere if needed
+            obs_dim = 19 * getattr(self.task_config, "agent_count", 1)
 
         self.task_obs = {
-        "observations": torch.zeros((self.num_envs, obs_dim), device=self.device),
-        "privileged_obs": torch.zeros((self.num_envs, 0), device=self.device),
-        "collisions": torch.zeros((self.num_envs, 1), device=self.device),
-        "rewards": torch.zeros((self.num_envs, 1), device=self.device),
+            "observations": torch.zeros((self.num_envs, obs_dim), device=self.device, requires_grad=False),
         }
 
+        # --- coverage config ---
+        # ---- world bounds (must come before visibility/proj_step_m) ----
+        bm = self.obs_dict.get("env_bounds_min", None)
+        bx = self.obs_dict.get("env_bounds_max", None)
+        self._bounds_min = bm.to(self.device) if isinstance(bm, torch.Tensor) else None  # (N,3) or None
+        self._bounds_max = bx.to(self.device) if isinstance(bx, torch.Tensor) else None  # (N,3) or None
+
+        # === 3-state visibility grid (0=unseen, 1=free, 2=obstacle) ===
+        self.grid_H, self.grid_W = getattr(self.task_config, "coverage_grid_hw", (100, 100))
+        self.visibility = torch.zeros((self.num_envs, self.grid_H, self.grid_W),
+                                    dtype=torch.uint8, device=self.device)
+        self.prev_visibility = self.visibility.clone()
+
+        # --- camera + projection params ---
+        rp = getattr(self.task_config, "reward_parameters", {})
+        self.cam_hfov_deg     = float(getattr(self.task_config, "cam_hfov_deg", 90.0))   # horizontal FOV (deg)
+        self.cam_max_range_m  = float(getattr(self.task_config, "cam_max_range_m", 10.0))
+        self.cam_min_range_m  = float(getattr(self.task_config, "cam_min_range_m", 0.2))
+        self.cam_stride       = int(getattr(self.task_config, "cam_stride", 8))          # sample width every N cols
+        self.hit_eps_m        = float(getattr(self.task_config, "ray_hit_epsilon_m", 0.15))  # treat near-max as “no hit”
+
+        # step size for ray marching (≈ one grid cell)
+        if self._bounds_min is not None and self._bounds_max is not None:
+            env_extent = (self._bounds_max[:, :2] - self._bounds_min[:, :2]).mean(dim=0)  # (2,)
+            cell_dx = (env_extent[0] / max(1, self.grid_W - 1)).item()
+            cell_dy = (env_extent[1] / max(1, self.grid_H - 1)).item()
+            self.proj_step_m = max(min(cell_dx, cell_dy), 1e-3)
+        else:
+            self.proj_step_m = 0.1  # safe default
+
+
+        # ---- reward weights  ----
+        rp = getattr(self.task_config, "reward_parameters", {})
+        self.new_free_reward       = float(rp.get("new_free_reward", 10.0))
+        self.new_obstacle_reward   = float(rp.get("new_obstacle_reward", 3.0))
+        self.cov_completion_thresh = float(rp.get("coverage_completion_threshold", 0.90))
+        self.cov_completion_bonus  = float(rp.get("completion_bonus", 500.0))
+        self.collision_penalty     = float(rp.get("collision_penalty", -5.0))
+
+
+        self.coverage = torch.zeros((self.num_envs, self.grid_H, self.grid_W),
+                                    dtype=torch.bool, device=self.device)
+        self.prev_coverage = torch.zeros_like(self.coverage)
+        self.global_step = 0
+
+        # height window reward 
+        self.alt_z_min       = float(rp.get("altitude_min_m", 0.8))
+        self.alt_z_max       = float(rp.get("altitude_max_m", 2.2))
+        self.alt_reward_in   = float(rp.get("altitude_reward_in_range", 1.0))
+        self.alt_penalty_out = float(rp.get("altitude_penalty_out_of_range", -1.0))
+
+        self.vel_forward_weight = float(rp.get("velocity_forward_weight", 0.0))
+        
+        # --- warm-up config & state ---
+        self._steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._warmup_len = int(getattr(self.task_config, "warmup_len_steps", 40))   # ~0.6s @ 60Hz
+        self._warmup_vz  = float(getattr(self.task_config, "warmup_vz_mps", 0.8))   # gentle takeoff
+        self._warmup_vx  = float(getattr(self.task_config, "warmup_vx_mps", 0.3))   # small forward nudge
+        self.warmup_steps = int(rp.get("warmup_steps", 0))
+        self.warmup_vx    = float(rp.get("warmup_vx", 0.0))
+        self.warmup_vz    = float(rp.get("warmup_vz", 0.0))
+
+        self.vel_forward_weight = float(rp.get("velocity_forward_weight", 0.0))
+
+        # early truncation (stagnation)
+        self.stagnation_patience = int(rp.get("stagnation_patience", 0))
+        self._no_new_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        
+        self.time_penalty = float(rp.get("time_penalty", 0.0))
+
+
+        # early truncation (stagnation)
+        self.stagnation_patience = int(rp.get("stagnation_patience", 0))
+        self._no_new_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+
+        # small time penalty
+        self.time_penalty = float(rp.get("time_penalty", 0.0))
+
+
+
+        exp_name = getattr(self.task_config, "experiment_name", "custom_slam_experiment")
+        log_dir = os.path.join("runs", exp_name)
+        self.metrics = SlamMetrics(log_dir=log_dir, num_envs=self.sim_env.num_envs,
+                                   save_maps_every=500, use_wandb=False)  
+
+
+    def _default_action_tf(self, action: torch.Tensor) -> torch.Tensor:
+        # Map 6D -> 4D [vx, vy, vz, yawrate] used by your controller
+        # Clamp and scale like NavigationTask does
+        a = torch.clamp(action, -1.0, 1.0).to(self.device).float()
+        max_speed = 2.0
+        max_yawrate = torch.pi / 3
+        out = torch.zeros((a.shape[0], 4), device=self.device)
+        # Simple mapping: use first three as velocities, 3rd as yaw
+        out[:, 0] = a[:, 0] * max_speed
+        out[:, 1] = a[:, 1] * 0.0         # lock side-velocity if your controller ignores it
+        out[:, 2] = a[:, 2] * max_speed
+        out[:, 3] = a[:, 3] * max_yawrate
+        return out
 
     def close(self):
         self.sim_env.delete_env()
 
-    def reset(self, *, seed=None, options=None):
-        # optional: use seed/options if you need
-        self.sim_env.reset()
-        self.coverage_maps.zero_()
-        self._update_observation()
-        info = {}  # could add anything you want to expose
-        return self.task_obs, info
-    
-    def reset_done(self):
-        # if you track per-env terminations, reset only those here.
-        # otherwise just refresh obs and return a dict like reset()
-        self._update_observation()
-        return self.task_obs
+    def reset(self):
+        self.reset_idx(torch.arange(self.num_envs, device=self.device))
+        return self.get_return_tuple()
 
     def reset_idx(self, env_ids):
         self.sim_env.reset_idx(env_ids)
-        self.coverage_maps[env_ids] = 0
+        if isinstance(env_ids, torch.Tensor) and env_ids.numel() > 0:
+            self.coverage[env_ids] = False
+            self.prev_coverage[env_ids] = False
+            # reset warm-up timer for those envs
+            env_ids_dev = env_ids.to(self._steps.device, non_blocking=True)
+            self._steps[env_ids_dev] = 0
+        self.infos = {}
+        return
+
 
     def render(self):
         return self.sim_env.render()
 
+
     def step(self, actions):
-        # ensure torch
-        if not isinstance(actions, torch.Tensor):
-            actions = torch.as_tensor(actions, device=self.device, dtype=torch.float32)
-        else:
-            actions = actions.to(self.device).float()
+        actions = torch.as_tensor(actions, device=self.device, dtype=torch.float32)
+        env_actions = self.action_transformation_function(actions)  # (N,4): [vx, vy, vz, yawrate]
 
+        # --- warmup: take off + move forward for first K steps per env ---
+        if self.warmup_steps > 0:
+            mask = (self._steps < self.warmup_steps)  # (N,)
+            if mask.any():
+                env_actions = env_actions.clone()
+                env_actions[mask, 0] = self.warmup_vx    # vx
+                env_actions[mask, 1] = 0.0               # vy
+                env_actions[mask, 2] = self.warmup_vz    # vz
+                env_actions[mask, 3] = 0.0               # yawrate
 
-        # map 6->4
-        env_actions = actions[..., :4]
-
-        # warmup override: send [vx,vy,vz,yaw] = [0,0,+vz,0] for first _warmup_len steps per env
-        warm_mask = (self._steps < self._warmup_len).view(-1, 1)  # (N,1)
-        if env_actions.dim() == 2 and env_actions.shape[0] == self.agent_count:
-            # agent-major actions; apply warmup to all agents
-            wz = torch.zeros_like(env_actions[:, 0])
-            env_actions = env_actions.clone()
-            env_actions[:, 0] = 0.0
-            env_actions[:, 1] = 0.0
-            env_actions[:, 2] = torch.where(warm_mask[0, 0], torch.full_like(wz, self._takeoff_vz), env_actions[:, 2])
-            env_actions[:, 3] = 0.0
-        elif env_actions.dim() == 2 and env_actions.shape[0] == self.num_envs:
-            # env-major actions
-            env_actions = env_actions.clone()
-            env_actions[:, 0] = 0.0
-            env_actions[:, 1] = 0.0
-            env_actions[:, 2] = torch.where(warm_mask.squeeze(1), torch.full_like(env_actions[:, 2], self._takeoff_vz), env_actions[:, 2])
-            env_actions[:, 3] = 0.0
-
-        # clamp to reasonable bounds for the controller
-        env_actions = torch.clamp(env_actions, -1.0, 1.0)
-
-        # step sim
         self.sim_env.step(actions=env_actions)
+        self.rewards[:], self.terminations[:] = self.compute_rewards_and_crashes(self.obs_dict)
+        ep_len = getattr(self.task_config, "episode_len_steps", 800)
+        self.truncations[:] = torch.where(self.sim_env.sim_steps > ep_len,
+                                        torch.ones_like(self.truncations),
+                                        torch.zeros_like(self.truncations))
+        reset_envs = self.sim_env.post_reward_calculation_step()
+        if len(reset_envs) > 0:
+            self.reset_idx(reset_envs)
 
-        # step counter
+        # advance step counters AFTER stepping
         self._steps += 1
+        # if envs were reset by the sim, clear counters for those
+        if len(reset_envs) > 0:
+            self._steps[reset_envs] = 0
+            self._no_new_counter[reset_envs] = 0        
 
-        # Update obs/reward/termination
-        self._update_observation()
-        self._compute_rewards()
+        # bump global step
+        self.global_step += 1
 
-        terminated, truncated = self._get_terminated_truncated()
-        terminated = terminated.view(self.num_envs)                  # (N,)
-        truncated  = truncated.view(self.num_envs)                   # (N,)
+        # save coverage snapshots every few steps
+        if hasattr(self, "metrics") and self.metrics is not None:
+            try:
+                # self.coverage is (N,H,W) bool in your code
+                self.metrics.maybe_save_coverage(self.coverage, step=self.global_step)
+            except Exception as e:
+                if not hasattr(self, "_cov_save_warned"):
+                    print(f"[CustomTask] WARNING: failed to save coverage image once: {e}")
+                    self._cov_save_warned = True
 
-        rewards_env = self.task_obs["rewards"]
-        # rewards may be (N,1) or (N,1,1); force to (N,)
-        rewards_env = rewards_env.reshape(self.num_envs, -1)[:, 0]   # (N,)
+        # quick textual sanity: log mean coverage every 50 steps
+        if (self.global_step % 200) == 0:
+            cov_frac = self.coverage.float().mean(dim=(1,2)).mean().item()
+            print(f"[CustomTask] step {self.global_step}: mean coverage frac = {cov_frac:.4f}")
+        
+        self.rewards[:], self.terminations[:] = self.compute_rewards_and_crashes(self.obs_dict)
+        ep_len = getattr(self.task_config, "episode_len_steps", 800)
+        self.truncations[:] = torch.where(self.sim_env.sim_steps > ep_len,
+                                        torch.ones_like(self.truncations),
+                                        torch.zeros_like(self.truncations))
+        reset_envs = self.sim_env.post_reward_calculation_step()
+        if len(reset_envs) > 0:
+            self.reset_idx(reset_envs)
 
-        # done_mask = (terminated | truncated)
-        # if done_mask.any():
-        #     ids = torch.nonzero(done_mask, as_tuple=False).squeeze(-1)
-        #     self.reset_idx(ids)
-        #     self._steps[ids] = 0
 
-        return self.task_obs, rewards_env, terminated, truncated, {}
+        return self.get_return_tuple()
 
+    
+    def get_return_tuple(self):
+        self.process_obs_for_task()
+        return (self.task_obs, self.rewards, self.terminations, self.truncations, self.infos)
 
-    def _update_observation(self):
-        pose, vel, imu = self._extract_state_from_sim()
-        # sanitize pose/vel/imu just in case
-        pose = torch.nan_to_num(pose, nan=0.0, posinf=1e6, neginf=-1e6)
-        vel  = torch.nan_to_num(vel,  nan=0.0, posinf=1e6, neginf=-1e6)
-        imu  = torch.nan_to_num(imu,  nan=0.0, posinf=1e6, neginf=-1e6)
+    def process_obs_for_task(self):
+        # If env provides single-robot fields (NavigationTask style), use them:
+        if all(k in self.obs_dict for k in ("robot_position", "robot_vehicle_orientation",
+                                            "robot_body_linvel", "robot_body_angvel")):
+            # Example packing: [pos(3), quat(4), linvel(3), angvel(3)] = 13 dims
+            pos   = self.obs_dict["robot_position"]            # (N,3)
+            quat  = self.obs_dict["robot_vehicle_orientation"] # (N,4) or ("robot_orientation")
+            lin_v = self.obs_dict["robot_body_linvel"]         # (N,3)
+            ang_v = self.obs_dict["robot_body_angvel"]         # (N,3)
+            flat = torch.cat([pos, quat, lin_v, ang_v], dim=-1)
+            # If your policy expects 19, pad; if 13 is correct for your config, set obs_dim accordingly
+            if flat.shape[1] < self.task_obs["observations"].shape[1]:
+                pad = torch.zeros((self.num_envs, self.task_obs["observations"].shape[1] - flat.shape[1]), device=self.device)
+                flat = torch.cat([flat, pad], dim=-1)
+            self.task_obs["observations"].copy_(flat)
+            return
 
+        # Otherwise fallback to your multi-agent root-state path
+        pose, vel, imu = self._extract_state_from_sim()  # you already have this implemented
         flat_obs = torch.cat(
             [pose.reshape(self.num_envs, -1),
-            vel.reshape(self.num_envs, -1),
-            imu.reshape(self.num_envs, -1)],
-            dim=-1,
+             vel.reshape(self.num_envs, -1),
+             imu.reshape(self.num_envs, -1)],
+            dim=-1
         )
-
-        # final clamp to a sane range to help the running mean/std
+        # clamp for stability (like you did)
         flat_obs = torch.clamp(flat_obs, -1e3, 1e3)
         self.task_obs["observations"].copy_(flat_obs)
-        self._update_coverage(pose)  # positions are in pose[..., :3]
+
+    def compute_rewards_and_crashes(self, obs_dict):
+        # update visibility from camera rays
+        self._update_visibility_from_camera()
+
+        cur  = self.visibility
+        prev = self.prev_visibility
+
+        # env fractions
+        newly_free  = ((cur == 1) & (prev != 1)).float().mean(dim=(1, 2))  # (N,)
+        newly_obst  = ((cur == 2) & (prev != 2)).float().mean(dim=(1, 2))  # (N,)
+        seen_frac   = (cur > 0).float().mean(dim=(1, 2))                   # (N,)
+        done_cov    = (seen_frac > self.cov_completion_thresh).float()     # (N,)
+
+        # collisions
+        crashes = obs_dict.get("crashes", torch.zeros(self.num_envs, device=self.device))
+        crashes = crashes.float().view(-1)
+
+        # altitude reward (as you already had)
+        if "robot_position" in obs_dict and getattr(self, "agent_count", 1) == 1:
+            z = obs_dict["robot_position"][:, 2].view(self.num_envs, 1)
+        else:
+            pose, _, _ = self._extract_state_from_sim()
+            z = pose[..., 2]  # (N,A)
+
+        in_range = (z >= self.alt_z_min) & (z <= self.alt_z_max)
+        r_alt = torch.where(in_range, self.alt_reward_in, self.alt_penalty_out).mean(dim=1)  # (N,)
+
+        # final reward
+        reward = (
+            self.new_free_reward     * newly_free +
+            self.new_obstacle_reward * newly_obst +
+            done_cov                 * self.cov_completion_bonus +
+            r_alt +
+            self.collision_penalty   * crashes
+        )
+
+        # lightweight metrics (optional)
+        self._last_metrics = {
+            "seen_frac":        seen_frac.detach(),
+            "newly_free_frac":  newly_free.detach(),
+            "newly_obst_frac":  newly_obst.detach(),
+            "alt_in_range":     in_range.float().mean(dim=1).detach(),
+            "reward":           reward.detach(),
+        }
+        try:
+            if hasattr(self, "metrics") and self.metrics is not None:
+                s = getattr(self, "num_task_steps", 0)
+                self.metrics.log_scalar("map/seen_frac_mean",        seen_frac.mean().item(), s)
+                self.metrics.log_scalar("map/newly_free_frac_mean",  newly_free.mean().item(), s)
+                self.metrics.log_scalar("map/newly_obst_frac_mean",  newly_obst.mean().item(), s)
+                self.metrics.log_scalar("alt/in_range_frac_mean",    in_range.float().mean().item(), s)
+                self.metrics.log_scalar("reward/mean",               reward.mean().item(), s)
+        except Exception:
+            pass
+
+        if hasattr(self, "metrics") and (getattr(self, "num_task_steps", 0) % 200 == 0):
+            try:
+                env0_img = self._grid_to_rgb(self.visibility[0]).detach().cpu().numpy()
+                self.metrics.save_map_image(env_id=0, img_rgb=env0_img, step=self.num_task_steps)
+            except Exception:
+                pass
+
+
+        return reward, crashes
+
+
+    def _update_visibility_from_camera(self):
+        """
+        Mark grid cells as seen free (1) along camera rays, and the terminal cell as obstacle (2) if a hit occurs.
+        Uses middle scanline of depth_range_pixels as a horizontal fan; falls back to a fixed-range FOV wedge if depth absent.
+        """
+        self.prev_visibility.copy_(self.visibility)
+
+        # robot XY and yaw per env
+        pos = self.obs_dict["robot_position"].to(self.device)
+        if pos.dim() == 3:              # (N,A,3) -> mean over agents
+            pos_xy = pos[..., :2].mean(dim=1)     # (N,2)
+        else:
+            pos_xy = pos[:, :2]                   # (N,2)
+
+        if "robot_euler_angles" in self.obs_dict:
+            yaw = self.obs_dict["robot_euler_angles"][:, 2].to(self.device)  # (N,)
+        else:
+            yaw = torch.zeros(self.num_envs, device=self.device)
+
+        # depth sampling (mid row, stride in columns)
+        depth = self.obs_dict.get("depth_range_pixels", None)  # expected (N,1,H,W), values in [0..1] scale
+        hfov = torch.deg2rad(torch.tensor(self.cam_hfov_deg, device=self.device))
+
+        if depth is not None:
+            depth = depth.to(self.device).float()
+            H, W = depth.shape[-2], depth.shape[-1]
+            row = H // 2
+            cols = torch.arange(0, W, step=max(1, self.cam_stride), device=self.device)
+            R = cols.numel()
+
+            # meters: clamp >0; treat too-small/invalid as max-range (free to max)
+            d = (depth[:, 0, row, cols] * self.cam_max_range_m).clamp(min=0.0)  # (N,R)
+            d[d <= self.cam_min_range_m] = self.cam_max_range_m
+            thetas = torch.linspace(-hfov / 2, hfov / 2, R, device=self.device)  # (R,)
+        else:
+            # fallback fan with fixed range
+            R = 32
+            d = torch.full((self.num_envs, R), self.cam_max_range_m, device=self.device)
+            thetas = torch.linspace(-hfov / 2, hfov / 2, R, device=self.device)
+
+        yaw_expanded = yaw.unsqueeze(1) + thetas.unsqueeze(0)  # (N,R)
+        dir_xy = torch.stack([torch.cos(yaw_expanded), torch.sin(yaw_expanded)], dim=-1)  # (N,R,2)
+
+        step = self.proj_step_m
+        max_steps = int(self.cam_max_range_m / step) + 1
+
+        # small helpers that don't overwrite obstacles with free:
+        def _mark_free(n, iy, ix):
+            cur = self.visibility[n]
+            mask = (cur[iy, ix] == 0)     # only unseen -> free
+            if mask.any():
+                cur[iy[mask], ix[mask]] = 1
+
+        def _mark_obstacle(n, iy, ix):
+            self.visibility[n, iy, ix] = 2  # always write obstacle
+
+        for n in range(self.num_envs):
+            p0 = pos_xy[n]  # (2,)
+            for r in range(d.shape[1]):
+                ray_len = float(d[n, r].item())
+                if ray_len <= 0.0:
+                    continue
+
+                steps = int(min(max_steps, max(1, math.ceil(ray_len / step))))
+                t = torch.linspace(step, steps * step, steps, device=self.device)  # (S,)
+                pts = p0.unsqueeze(0) + t.unsqueeze(1) * dir_xy[n, r].unsqueeze(0)  # (S,2)
+
+                # map to grid
+                iy, ix = self._xy_to_grid(pts.view(1, -1, 2))  # (1,S)
+                iy = iy[0]; ix = ix[0]
+
+                # drop consecutive duplicates (staying inside same cell)
+                if iy.numel() > 1:
+                    keep = torch.ones_like(iy, dtype=torch.bool)
+                    keep[1:] = (iy[1:] != iy[:-1]) | (ix[1:] != ix[:-1])
+                    iy = iy[keep]; ix = ix[keep]
+
+                if iy.numel() == 0:
+                    continue
+
+                # did the ray hit something? (depth < max_range - eps) -> last cell is obstacle
+                hit = ray_len < (self.cam_max_range_m - self.hit_eps_m)
+                if hit and iy.numel() >= 1:
+                    if iy.numel() > 1:
+                        _mark_free(n, iy[:-1], ix[:-1])  # free up to hit
+                    _mark_obstacle(n, iy[-1], ix[-1])    # obstacle at hit cell
+                else:
+                    _mark_free(n, iy, ix)                # no hit: all free
+        
+    def _xy_to_grid(self, pos_xy: torch.Tensor):
+        """Map world XY -> grid indices. pos_xy: (N,A,2). Returns iy, ix as Long (N,A)."""
+        H, W = self.grid_H, self.grid_W
+        if self._bounds_min is None or self._bounds_max is None:
+            min_xy = torch.tensor([-5.0, -5.0], device=self.device).view(1, 1, 2)
+            max_xy = torch.tensor([ 5.0,  5.0], device=self.device).view(1, 1, 2)
+        else:
+            min_xy = self._bounds_min[:, :2].unsqueeze(1)  # (N,1,2)
+            max_xy = self._bounds_max[:, :2].unsqueeze(1)  # (N,1,2)
+
+        u = ((pos_xy - min_xy) / (max_xy - min_xy).clamp(min=1e-6)).clamp(0.0, 1.0)
+        ix = (u[..., 0] * (W - 1)).round().long().clamp(0, W - 1)
+        iy = (u[..., 1] * (H - 1)).round().long().clamp(0, H - 1)
+        return iy, ix
+
+
+    def _update_coverage_from_obs(self):
+        """Marks current robot XY cells as visited in self.coverage."""
+        self.prev_coverage.copy_(self.coverage)
+
+        # Prefer env-provided positions
+        if "robot_position" in self.obs_dict:
+            pos = self.obs_dict["robot_position"].to(self.device)
+            # Accept (N,3) or (N,A,3)
+            if pos.dim() == 2 and pos.shape[0] == self.num_envs and pos.shape[1] == 3:
+                pos = pos.view(self.num_envs, 1, 3)             # (N,1,3)
+            elif pos.dim() == 3 and pos.shape[-1] == 3:
+                pass                                            # (N,A,3)
+            else:
+                # last-resort reshape if someone changed layout to (N*A,3)
+                pos = pos.view(self.num_envs, -1, 3)
+        else:
+            # Fallback only if absolutely needed
+            pose, _, _ = self._extract_state_from_sim()
+            pos = pose[..., :3]                                  # (N,A,3)
+
+        iy, ix = self._xy_to_grid(pos[..., :2])                 # (N,A)
+        env_ids = torch.arange(self.num_envs, device=self.device).unsqueeze(1).expand_as(iy)
+        self.coverage[env_ids, iy, ix] = True
 
 
     def _extract_state_from_sim(self):
@@ -328,194 +664,7 @@ class CustomTask(BaseTask):
             self._logged_state_source = True
             print(f"[CustomTask] Using root states from: {src_name}, shape={tuple(root_states.shape)}")
 
-        return pose, vel, imu
-    
-    def _get_commanded_vz_envwise(self):
-        rm = getattr(self.sim_env, "robot_manager", None)
-        if rm is None or not hasattr(rm, "actions"):
-            return torch.zeros((self.num_envs, 1), device=self.device)
-        act = rm.actions
-        if not isinstance(act, torch.Tensor):
-            act = torch.as_tensor(act, device=self.device)
-        act = act.to(self.device).float()
-        # expect (agents, 4) -> take column 2 (vz), average across agents → (1,) then expand to (N,1)
-        if act.dim() == 2 and act.shape[1] >= 3:
-            vz_env = act[:, 2].mean().view(1, 1).repeat(self.num_envs, 1)
-            return vz_env
-        return torch.zeros((self.num_envs, 1), device=self.device)
+        return pose, vel, imu   
 
 
-    def _get_collisions_envwise(self) -> torch.Tensor:
-        c = None
-        if hasattr(self.sim_env, "collision_tensor"):
-            c = self.sim_env.collision_tensor
-        elif hasattr(self.sim_env, "robot_manager") and hasattr(self.sim_env.robot_manager, "collision_tensor"):
-            c = self.sim_env.robot_manager.collision_tensor
-
-        if c is None:
-            # fallback: no collision info
-            return torch.zeros((self.num_envs, 1), device=self.device)
-
-        if not isinstance(c, torch.Tensor):
-            c = torch.as_tensor(c, device=self.device)
-
-        c = c.to(self.device).float()
-
-        # Normalize shape to (num_envs, 1):
-        if c.dim() == 0:
-            c = c.view(1, 1).repeat(self.num_envs, 1)
-        elif c.dim() == 1:
-            # Could be (num_envs,) or (agent_count,)
-            if c.shape[0] == self.num_envs:
-                c = c.view(self.num_envs, 1)
-            else:
-                # interpret as per-agent, reduce to per-env by any collision
-                per_env_any = (c.view(1, -1) > 0).any(dim=1, keepdim=True).float()
-                c = per_env_any.repeat(self.num_envs, 1)  # single env replicated
-        elif c.dim() == 2:
-            # If shape is (num_envs, agent_count), reduce to any-agent collision per env
-            if c.shape[0] == self.num_envs:
-                c = (c > 0).any(dim=1, keepdim=True).float()
-            else:
-                # Unknown layout; safest fallback
-                c = torch.zeros((self.num_envs, 1), device=self.device)
-
-        else:
-            c = torch.zeros((self.num_envs, 1), device=self.device)
-
-        return c
-    
-
-    def _get_terminated_truncated(self):
-        N = self.num_envs
-        # terminated: env-level collisions if available
-        collisions_env = self._get_collisions_envwise()     # (N,1)
-        terminated = (collisions_env > 0).view(N)           # (N,), bool
-
-        # truncated: time limit
-        limit = getattr(self.task_config, "episode_len_steps", 800)
-        truncated = (self._steps >= limit)                   # (N,), bool
-        return terminated, truncated
-
-
-
-    def _update_coverage(self, pose):
-        positions = pose[:, :, :3]  # shape: (envs, agents, 3)
-        grid_size = 0.5
-
-        indices = torch.clamp((positions[..., :2] / grid_size + 50).long(), 0, 99)  # (envs, agents, 2)
-        for env_idx in range(self.num_envs):
-            for agent_idx in range(self.agent_count):
-                x, y = indices[env_idx, agent_idx]
-                self.coverage_maps[env_idx, agent_idx, x, y] = 1.0
-
-    def _compute_rewards(self):
-        N, A = self.num_envs, self.agent_count
-
-        # 1) collisions -> (N,1)
-        c = None
-        if hasattr(self.sim_env, "collision_tensor"):
-            c = self.sim_env.collision_tensor
-        elif hasattr(self.sim_env, "robot_manager") and hasattr(self.sim_env.robot_manager, "collision_tensor"):
-            c = self.sim_env.robot_manager.collision_tensor
-
-        if c is None:
-            collisions_env = torch.zeros((N, 1), device=self.device)
-        else:
-            if not isinstance(c, torch.Tensor):
-                c = torch.as_tensor(c, device=self.device)
-            c = c.to(self.device).float()
-            # normalize to (N,1)
-            if c.dim() == 0:
-                collisions_env = c.view(1, 1).repeat(N, 1)
-            elif c.dim() == 1:
-                if c.shape[0] == N:
-                    collisions_env = c.view(N, 1)
-                elif c.shape[0] == A:
-                    collisions_env = (c.view(1, A) > 0).any(dim=1, keepdim=True).float().repeat(N, 1)
-                else:
-                    collisions_env = torch.zeros((N, 1), device=self.device)
-            elif c.dim() == 2 and c.shape == (N, A):
-                collisions_env = (c > 0).any(dim=1, keepdim=True).float()
-            else:
-                collisions_env = torch.zeros((N, 1), device=self.device)
-
-        # 2) exploration -> (N,1)
-        explored_any = (self.coverage_maps > 0).any(dim=1).float()              # (N,H,W)
-        explored_frac = explored_any.mean(dim=(1, 2)).unsqueeze(1)              # (N,1)
-
-        # Track newly explored cells this step
-        newly_explored = ((self.coverage_maps - self.prev_coverage_maps) > 0).float()
-        newly_explored_frac = newly_explored.mean(dim=(1, 2)).unsqueeze(1)
-
-        r_explore = self.params["new_area_reward"] * newly_explored_frac
-
-        # Store current as previous for next step
-        self.prev_coverage_maps = self.coverage_maps.clone()
-
-        # Terminal reward: all coverage above threshold
-        coverage_ratio = explored_frac  # from before
-        done_coverage = (coverage_ratio > self.params["coverage_completion_threshold"]).float()
-        r_completion = done_coverage * self.params["completion_bonus"]
-
-        if coverage_ratio.mean() > 0.2:
-            print(f"[DEBUG] [CustomTask] Coverage ratio: {coverage_ratio.mean().item():.2f} (threshold: {self.params['coverage_completion_threshold']})")
-
-
-
-        # 3) update altitude proxy
-        vz_env = self._get_commanded_vz_envwise()           # (N,1) in policy units
-        vz_mps = vz_env * 1.0
-        self._est_z = torch.clamp(self._est_z + vz_mps * self._dt, 0.0, self._z_max)
-
-        # 4) altitude shaping: reward if within [0.3, 2.7] m, penalize otherwise
-        in_range = ((self._est_z >= 0.3) & (self._est_z <= 2.7)).float()
-        r_alt = in_range * 1.0 + (~in_range.bool()).float() * -1.0  # +1 if in range, -1 if out
-
-        # 5) encourage linear velocity (average |vx,vy,vz| per env)
-        # Get velocities from sim state
-        pose, vel, imu = self._extract_state_from_sim()
-        lin_vel = vel[..., :3]  # (N, A, 3)
-        lin_vel_mag = torch.norm(lin_vel, dim=-1)  # (N, A)
-        avg_lin_vel = lin_vel_mag.mean(dim=1, keepdim=True)  # (N, 1)
-        r_vel = avg_lin_vel  # scale as needed, e.g. *1.0
-
-        # 6) anti-fall from commands (helps early learning)
-        up_bonus = torch.relu(vz_env)
-        down_pen = torch.relu(-vz_env)
-        anti_fall = 0.5 * up_bonus - 1.0 * down_pen
-
-        # 7) compose env-level reward (N,1)
-        
-    
-        reward = (
-                    r_explore
-                    + r_completion
-                    - 5.0 * collisions_env
-                    + r_alt
-                    + anti_fall
-                    + 1.0 * r_vel
-                )
-
-        reward = reward.sum(dim=(1, 2), keepdim=True)
-        reward = reward.view(self.num_envs, 1) 
-
-        # 8) write back
-        self.task_obs["collisions"].copy_(collisions_env)  # (N,1)
-        self.task_obs["rewards"].copy_(reward)             # (N,1)
-
-
-
-
-
-@torch.jit.script
-def compute_reward(
-    pos_error: torch.Tensor,
-    collisions: torch.Tensor,
-    action: torch.Tensor,
-    prev_action: torch.Tensor,
-    curriculum_level_multiplier: float,
-    parameter_dict: TypingDict[str, float]
-) -> torch.Tensor:
-    reward = -pos_error - 5.0 * collisions
-    return reward
+  
