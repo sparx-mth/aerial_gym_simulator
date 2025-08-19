@@ -32,7 +32,7 @@ params:
     clip_value: False
     num_actors: 3                         # keep in sync with env_config.num_envs
     horizon_length: 64
-    minibatch_size: 256
+    minibatch_size: 192
     mini_epochs: 4
     critic_coef: 2
     normalize_input: True
@@ -77,6 +77,8 @@ params:
         mu_init: { name: default }
         sigma_init: { name: const_initializer, val: -0.5 }
         fixed_sigma: False
+        initial_log_sigma: -0.5
+        bounds_log_sigma: [-2.0, 1.0]   # keep std in [~0.14, ~2.7]
 
     mlp:
       units: [256, 128, 64]

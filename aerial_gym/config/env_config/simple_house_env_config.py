@@ -5,7 +5,13 @@ import numpy as np
 class SimpleHouseEnvCfg(EnvObjectConfig):
     class env:
         # how many parallel envs to spawn
-        num_envs = 3
+        num_envs = 16
+        robots_per_env = 3
+        # keep every env layout fixed for the whole run
+        keep_same_env_for_num_episodes = 10_000_000    # effectively “never” change
+        randomize_rooms_on_reset = False          # make intent explicit
+        per_env_seed_offset = 1000                # for reproducible per-env randomness
+
         # number of "environment actions" (optional; leave 0 if not using runtime dynamics yet)
         num_env_actions = 0
 
@@ -23,7 +29,6 @@ class SimpleHouseEnvCfg(EnvObjectConfig):
         create_ground_plane = False       # we’ll use our own “floor” asset
         sample_timestep_for_latency = True
         perturb_observations = True
-        keep_same_env_for_num_episodes = 1
 
         # warp / bounds (12x12x3 m house-like volume)
         use_warp = True
