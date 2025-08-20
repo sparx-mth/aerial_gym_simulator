@@ -279,6 +279,26 @@ class CustomTask(BaseTask):
     # -------------------------------------------------------------------------------------------------------------------------------------
     def get_return_tuple(self):
         self.process_obs_for_task()
+            # This prevents NaNs from being passed to the policy network
+        self.task_obs["observations"] = torch.nan_to_num(self.task_obs["observations"], nan=0.0, posinf=0.0, neginf=0.0)
+
+        coverage_done = (self.visibility > 0).float().mean(dim=(1, 2)) >= self.coverage_thresh
+        self.terminations[:] = torch.logical_or(self.terminations, coverage_done)
+        
+        ep_len = int(getattr(self.task_config, "episode_len_steps", 800))
+        self.truncations[:] = torch.where(
+            self.sim_env.sim_steps > ep_len,
+            torch.ones_like(self.truncations),
+            torch.zeros_like(self.truncations),
+        )
+        self.global_step += 1
+        self._steps += 1
+        self._update_visibility_from_camera()
+        
+        terminated_envs = torch.nonzero(self.terminations).view(-1)
+        if len(terminated_envs) > 0:
+            print(f"[Custom Task] [Step {self.global_step}] Terminated envs: {terminated_envs.tolist()}")
+
         return self.task_obs, self.rewards, self.terminations, self.truncations, {}
     
     # -------------------------------------------------------------------------------------------------------------------------------------
@@ -294,13 +314,21 @@ class CustomTask(BaseTask):
              'CONST_GLOBAL_VERTEX_TO_ASSET_INDEX_TENSOR', 'VERTEX_MAPS_PER_ENV_ORIGINAL', 'robot_mass', 'robot_inertia', 'robot_actions',
              'robot_prev_actions', 'dof_control_mode', 'robot_vehicle_orientation', 'robot_vehicle_linvel', 'num_robot_actions', 'depth_range_pixels', 'segmentation_pixels']
 
+    # -------------------------------------------------------------------------------------------------------------------------------------
     def reset_idx(self, env_ids):
         if self.root_tensor is None:
-            self.root_tensor = self.sim_env.IGE_env.vec_root_tensor  # (N_envs, N_assets, 13)
-        root_states = self.root_tensor[env_ids]
-        print("[Custom Task] [Reset IDX] Root state:", root_states)
+            self.root_tensor = self.sim_env.IGE_env.vec_root_tensor
 
-        self.sim_env.reset_idx(env_ids)  # this calls EnvManager.reset_idx above
+        self.sim_env.reset_idx(env_ids)
+
+        # CRITICAL FIX: Manually correct the quaternion to a valid state
+        # A valid quaternion for no rotation is (0, 0, 0, 1)
+        if self.root_tensor.shape[-1] >= 7:
+            # Get the quaternion slice from the actual tensor used by the simulation
+            quats = self.obs_dict["vec_root_tensor"][env_ids, 0, 3:7]
+            # Replace the invalid quaternion with a valid one for no rotation
+            quats[:] = 0.0
+            quats[:, 3] = 1.0
 
         if isinstance(env_ids, torch.Tensor) and env_ids.numel() > 0:
             env_ids = env_ids.to(self.device, non_blocking=True)
@@ -324,9 +352,11 @@ class CustomTask(BaseTask):
             self.ground_truth_map = self.visibility.clone()
         
         self.infos = {}
-
+        
+        # Print the full state of the first drone AFTER the fix for debugging
+        print("[Custom Task] [Reset IDX] Full root state AFTER FIX:", self.obs_dict["vec_root_tensor"][env_ids][0, 0])
         print("[Custom Task] [Reset IDX] Drone pos after reset:", self.obs_dict["robot_position"][env_ids])
-
+        
         return
     # -------------------------------------------------------------------------------------------------------------------------------------
     def _action_transform(self, a):
@@ -349,6 +379,7 @@ class CustomTask(BaseTask):
                           vel.view(self.num_envs, -1),
                           imu.view(self.num_envs, -1)], dim=-1)
         flat = flat[:, :self.obs_dim]
+        flat = torch.nan_to_num(flat, nan=0.0, posinf=0.0, neginf=0.0)
         self.task_obs["observations"].copy_(flat)
     
     # -------------------------------------------------------------------------------------------------------------------------------------
@@ -461,7 +492,6 @@ class CustomTask(BaseTask):
                 self.visibility[nids, rob_iy[valid], rob_ix[valid]],
                 torch.ones_like(rob_iy[valid], dtype=torch.uint8)
             )
-
     # -------------------------------------------------------------------------------------------------------------------------------------
     def _extract_state_from_sim(self):
         """
@@ -470,104 +500,29 @@ class CustomTask(BaseTask):
         vel:  (envs, agents, 6) -> [vx,vy,vz, wx,wy,wz]
         imu:  (envs, agents, 6) -> [ax,ay,az, gx,gy,gz] (zeros if not available)
         """
-        rm = getattr(self.sim_env, "robot_manager", None)
-        if rm is None:
-            raise RuntimeError("sim_env has no 'robot_manager' attribute; cannot extract states.")
-
-        # Common Isaac/IsaacGym names to try
-        candidate_names = [
-            "actor_root_state_tensor",
-            "root_state_tensor",
-            "root_states",
-            "rb_states",
-            "rigid_body_states",
-            "state_tensor",
-            "states",
-        ]
-
-        def _try_get_tensor(obj, names):
-            for n in names:
-                if hasattr(obj, n):
-                    t = getattr(obj, n)
-                    if isinstance(t, torch.Tensor):
-                        return t, n
-            return None, None
-
-        # 1) Try on robot_manager
-        root_states, src_name = _try_get_tensor(rm, candidate_names)
-
-        # 2) Try directly on sim_env if not found
-        if root_states is None:
-            root_states, src_name = _try_get_tensor(self.sim_env, candidate_names)
-
-        # 3) Try per-robot list/dict
-        if root_states is None:
-            robots = getattr(rm, "robots", None)
-            if isinstance(robots, (list, tuple)) and len(robots) > 0:
-                per = []
-                for i, rob in enumerate(robots):
-                    t, _ = _try_get_tensor(rob, candidate_names)
-                    if t is None:
-                        continue
-                    per.append(t)
-                if per:
-                    root_states = torch.stack(per, dim=1)  # (envs, agents, feat) OR (agents, feat)
-                    src_name = "robots[*].<state_tensor>"
-                    # If shape ends up (agents, feat), expand envs dimension
-                    if root_states.dim() == 2:
-                        root_states = root_states.unsqueeze(0).repeat(self.num_envs, 1, 1)
+        # Direct and correct access to the root state tensor
+        # The previous debug log showed this is the correct path.
+        root_states = self.sim_env.IGE_env.vec_root_tensor
 
         if root_states is None:
-            # One-shot debug dump (keep it)
-            if not hasattr(self, "_logged_attr_dump"):
-                self._logged_attr_dump = True
-                print("[CustomTask] Could not find root states. Available robot_manager attrs:")
-                for k in dir(rm):
-                    if k.startswith("_"):
-                        continue
-                    try:
-                        v = getattr(rm, k)
-                        if isinstance(v, torch.Tensor):
-                            print(f"  - rm.{k}: shape={tuple(v.shape)}")
-                    except Exception:
-                        pass
-                print("[CustomTask] Available sim_env attrs:")
-                for k in dir(self.sim_env):
-                    if k.startswith("_"):
-                        continue
-                    try:
-                        v = getattr(self.sim_env, k)
-                        if isinstance(v, torch.Tensor):
-                            print(f"  - sim_env.{k}: shape={tuple(v.shape)}")
-                    except Exception:
-                        pass
-
-            # Fallback: fabricate zeros so training can proceed
-            # (Optionally infer agent_count from rm.actions)
+            # Fallback: fabricate zeros if the tensor is still not available.
+            # This code should ideally not be reached now.
+            rm = getattr(self.sim_env, "robot_manager", None)
             if hasattr(rm, "actions") and isinstance(rm.actions, torch.Tensor):
                 self.agent_count = int(rm.actions.shape[0])
 
             pose = torch.zeros((self.num_envs, self.agent_count, 7), device=self.device)
             pose[..., 6] = 1.0  # unit quaternion
-            vel  = torch.zeros((self.num_envs, self.agent_count, 6), device=self.device)
-            imu  = torch.zeros((self.num_envs, self.agent_count, 6), device=self.device)
-
+            vel = torch.zeros((self.num_envs, self.agent_count, 6), device=self.device)
+            imu = torch.zeros((self.num_envs, self.agent_count, 6), device=self.device)
             if not hasattr(self, "_warned_no_states"):
                 self._warned_no_states = True
                 print("[CustomTask] WARNING: no kinematic state found; using zeroed pose/vel/imu. Wire root states later.")
-
             return pose, vel, imu
 
-
-        # Ensure tensor on correct device
-        if not isinstance(root_states, torch.Tensor):
-            root_states = torch.as_tensor(root_states, device=self.device)
-        else:
-            root_states = root_states.to(self.device)
-
-        # Normalize to (envs, agents, F)
+        # Ensure tensor on correct device and normalized to (envs, agents, F)
+        root_states = root_states.to(self.device)
         if root_states.dim() == 2:
-            # Expect (envs*agents, F)
             F = root_states.shape[-1]
             total = root_states.shape[0]
             if total % self.num_envs == 0:
@@ -575,44 +530,41 @@ class CustomTask(BaseTask):
                 root_states = root_states.view(self.num_envs, inferred_agents, F)
                 self.agent_count = inferred_agents
             else:
-                # fallback: assume agents-first
                 root_states = root_states.unsqueeze(0).repeat(self.num_envs, 1, 1)
 
         # The usual Isaac root layout: [px,py,pz, qx,qy,qz,qw, vx,vy,vz, wx,wy,wz]
         F = root_states.shape[-1]
         if F >= 13:
-            pos   = root_states[..., 0:3]
-            quat  = root_states[..., 3:7]
+            pos = root_states[..., 0:3]
+            quat = root_states[..., 3:7]
             lin_v = root_states[..., 7:10]
             ang_v = root_states[..., 10:13]
         elif F == 12:
-            # Sometimes quat last or missing one comp; make a best-effort split
-            pos   = root_states[..., 0:3]
-            quat  = root_states[..., 3:7]
+            pos = root_states[..., 0:3]
+            quat = root_states[..., 3:7]
             lin_v = root_states[..., 7:10]
             ang_v = root_states[..., 10:12]
-            # pad ang_v to 3
             pad = torch.zeros((*ang_v.shape[:-1], 1), device=self.device)
             ang_v = torch.cat([ang_v, pad], dim=-1)
         else:
-            # Minimal fallback: positions only; zero the rest
-            pos   = root_states[..., 0:3]
-            quat  = torch.zeros((*pos.shape[:-1], 4), device=self.device); quat[..., -1] = 1.0
+            pos = root_states[..., 0:3]
+            quat = torch.zeros((*pos.shape[:-1], 4), device=self.device); quat[..., -1] = 1.0
             lin_v = torch.zeros((*pos.shape[:-1], 3), device=self.device)
             ang_v = torch.zeros((*pos.shape[:-1], 3), device=self.device)
 
         pose = torch.cat([pos, quat], dim=-1)
-        vel  = torch.cat([lin_v, ang_v], dim=-1)
+        vel = torch.cat([lin_v, ang_v], dim=-1)
 
-
+        # Handle IMU data (left as is)
         imu = None
+        rm = getattr(self.sim_env, "robot_manager", None)
         if hasattr(rm, "imu_buffer"):
             imu_buf = rm.imu_buffer
             imu = imu_buf.view(self.num_envs, self.agent_count, -1).to(self.device)
         elif hasattr(rm, "accel_buffer") and hasattr(rm, "gyro_buffer"):
-            acc  = rm.accel_buffer.view(self.num_envs, self.agent_count, -1).to(self.device)
+            acc = rm.accel_buffer.view(self.num_envs, self.agent_count, -1).to(self.device)
             gyro = rm.gyro_buffer.view(self.num_envs, self.agent_count, -1).to(self.device)
-            imu  = torch.cat([acc, gyro], dim=-1)
+            imu = torch.cat([acc, gyro], dim=-1)
         elif hasattr(rm, "get_imu"):
             imu = rm.get_imu()
             if not isinstance(imu, torch.Tensor):
@@ -622,11 +574,6 @@ class CustomTask(BaseTask):
 
         if imu is None:
             imu = torch.zeros((self.num_envs, self.agent_count, 6), device=self.device)
-
-        # One-time info
-        if not hasattr(self, "_logged_state_source"):
-            self._logged_state_source = True
-            print(f"[CustomTask] Using root states from: {src_name}, shape={tuple(root_states.shape)}")
 
         return pose, vel, imu
     # -------------------------------------------------------------------------------------------------------------------------------------
