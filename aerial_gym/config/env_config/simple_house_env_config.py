@@ -8,8 +8,8 @@ class SimpleHouseEnvCfg(EnvObjectConfig):
         num_envs = 16
         robots_per_env = 3
         # keep every env layout fixed for the whole run
-        keep_same_env_for_num_episodes = 10_000_000    # effectively “never” change
-        randomize_rooms_on_reset = False          # make intent explicit
+        keep_same_env_for_num_episodes = 1 
+        randomize_rooms_on_reset = True          
         per_env_seed_offset = 1000                # for reproducible per-env randomness
 
         # number of "environment actions" (optional; leave 0 if not using runtime dynamics yet)
@@ -39,6 +39,9 @@ class SimpleHouseEnvCfg(EnvObjectConfig):
 
         write_to_sim_at_every_timestep = False   # no per-step writes (safe default)
         write_to_sim_every_n_steps = 1           # only used if the manager checks this
+
+        experiment_name = "custom_slam_experiment"  # for saving assets, etc.
+
 
     class env_config:
         # Turn on outer walls and our new internal walls.

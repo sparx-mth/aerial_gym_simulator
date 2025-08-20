@@ -6,10 +6,17 @@ from aerial_gym.utils.logging import CustomLogger
 logger = CustomLogger("asset_manager")
 logger.setLevel("DEBUG")
 
+import torch
+
+import os
+
 
 class AssetManager:
     def __init__(self, global_tensor_dict, num_keep_in_env):
         self.init_tensors(global_tensor_dict, num_keep_in_env)
+        self.randomize_on_reset = True
+
+
 
     def init_tensors(self, global_tensor_dict, num_keep_in_env):
         self.env_asset_state_tensor = global_tensor_dict["env_asset_state_tensor"]
@@ -49,6 +56,8 @@ class AssetManager:
         self.reset_idx(torch.arange(self.env_asset_state_tensor.shape[0]), num_obstacles_per_env)
 
     def reset_idx(self, env_ids, num_obstacles_per_env=0):
+        if not self.randomize_on_reset:
+            return  # No re-randomization unless allowed by config
         if num_obstacles_per_env < self.num_keep_in_env:
             logger.info(
                 "Number of obstacles required in the environment by the \
@@ -69,3 +78,7 @@ class AssetManager:
         )
         # put those obstacles not needed in the environment outside
         self.env_asset_state_tensor[env_ids, num_obstacles_per_env:, 0:3] = -1000.0
+
+
+
+

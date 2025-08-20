@@ -18,6 +18,9 @@ from aerial_gym.utils.logging import CustomLogger
 
 import math, random
 import numpy as np
+import matplotlib.pyplot as plt
+import cv2
+import os
 from aerial_gym.env_manager.room_layout import RoomParams, sample_room_params, quat_from_yaw
 
 
@@ -72,6 +75,10 @@ class EnvManager(BaseManager):
         self.keep_in_env = None
 
         self.global_tensor_dict = {}
+
+        exp_name = getattr(self.cfg.env, "experiment_name", "custom_slam_experiment")
+        self.output_dir = os.path.join(exp_name, "asset_manager")
+        os.makedirs(self.output_dir, exist_ok=True)
 
         logger.info("Populating environments.")
         self.populate_env(env_cfg=self.cfg, sim_cfg=self.sim_config)
@@ -336,6 +343,7 @@ class EnvManager(BaseManager):
                 self.asset_max_state_ratio.append(
                     torch.tensor(asset_info["max_state_ratio"], device=self.device)
                 )
+            
 
         # Step 5: Stack and store ratio tensors
         if self.asset_min_state_ratio:
@@ -373,6 +381,10 @@ class EnvManager(BaseManager):
         self.num_robot_actions = self.global_tensor_dict["num_robot_actions"]
 
         self._scatter_floor_objects_once()
+
+        # only randomize on reset if config says so
+        self.asset_manager.randomize_on_reset = self.cfg.env.randomize_rooms_on_reset
+        
         # store per-env static room layouts (sampled once)
         self._room_params = [None] * self.num_envs
         self._init_room_layouts_once()
@@ -394,6 +406,11 @@ class EnvManager(BaseManager):
             chk = p[..., :3].sum(dim=dims)
             chk = (chk * 1e4).round() / 1e4
             print("[EnvManager] room checksums per env (fixed):", chk.tolist())
+        
+        # Save ground truth layout images (top-down binary maps)
+        for env_id in range(self.num_envs):
+            self.save_ground_truth_map_lines_image(env_id=env_id)
+
 
     # -------------------------------------------------------------------------------------------------------------------------------------
     def reset_idx(self, env_ids=None):
@@ -420,6 +437,10 @@ class EnvManager(BaseManager):
             print("[room drift check env0] L2 delta:", float((p - self._room_pos0[0]).abs().max()))
         # Keep rooms static: re-apply the saved layout for these envs
         self._reapply_room_layouts(env_ids)
+        # Add a debug log after _reapply_room_layouts(env_ids) and right before step() starts to confirm tensor values aren’t changing.
+
+        print("Reapplying layout hash:", torch.sum(self.global_tensor_dict["env_asset_state_tensor"]).item())
+
         self.IGE_env.write_to_sim()
         self.sim_steps[env_ids] = 0
 
@@ -611,3 +632,49 @@ class EnvManager(BaseManager):
                 else:
                     pos[eid, i, :].fill_(3e6)  # hide extra objects far away
 
+    # -------------------------------------------------------------------------------------------------------------------------------------
+    def save_ground_truth_map_lines_image(self, env_id=0, filename=None,
+                                        map_size=512, map_extent=6.0, default_length=1.0):
+        """
+        Converts 3D layout of obstacles into a top-down binary map with line segments.
+        Each line represents a wall or panel using its position and heading.
+        """
+        asset_states = self.global_tensor_dict["env_asset_state_tensor"]  # shape: [num_envs, num_assets, 13]
+        layout_pos = asset_states[env_id, :, 0:3].cpu().numpy()           # (x, y, z)
+        layout_quat = asset_states[env_id, :, 3:7].cpu().numpy()          # (qx, qy, qz, qw)
+
+        image = np.zeros((map_size, map_size), dtype=np.uint8)
+        pixel_per_meter = map_size / (2 * map_extent)
+
+        def quat_to_yaw(qx, qy, qz, qw):
+            return math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+
+        for i in range(layout_pos.shape[0]):
+            pos = layout_pos[i]
+            quat = layout_quat[i]
+            if np.any(np.abs(pos) > 100):  # Skip teleported
+                continue
+
+            x, y = pos[:2]
+            yaw = quat_to_yaw(*quat)
+
+            # Wall endpoints in world coordinates
+            dx = (default_length / 2.0) * math.cos(yaw)
+            dy = (default_length / 2.0) * math.sin(yaw)
+            x1, y1 = x - dx, y - dy
+            x2, y2 = x + dx, y + dy
+
+            # Convert to pixel space
+            def to_pixel(p):
+                return int((p[0] + map_extent) * pixel_per_meter), int((p[1] + map_extent) * pixel_per_meter)
+
+            pt1 = to_pixel((x1, y1))
+            pt2 = to_pixel((x2, y2))
+
+            # Draw line on image
+            cv2.line(image, pt1, pt2, 255, thickness=1)
+
+        if filename is None:
+            filename = os.path.join(self.output_dir, f"gt_map_lines_env_{env_id}.png")
+
+        plt.imsave(filename, image, cmap='gray')

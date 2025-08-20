@@ -25,7 +25,7 @@ class task_config:
 
     # --- camera-driven coverage settings ---
     use_camera_coverage = True
-    coverage_grid_hw = (96, 96)             # H, W of topdown map (tune vs. speed)
+    coverage_grid_hw = (512, 512)             # H, W of topdown map (tune vs. speed)
     camera_fov_h_deg = 90.0                 # horizontal FOV (deg)
     camera_fov_v_deg = 0.0                  # 0 = auto infer from image aspect; else set explicitly
     camera_update_every = 2                 # update coverage every k env steps
@@ -50,7 +50,7 @@ class task_config:
         "new_area_reward": 10.0,                 # kept for compatibility (not used if you switched to absolute ratio)
         "new_free_reward": 10.0,                 # reward per newly-seen free cell fraction (if you use delta form)
         "new_obstacle_reward": 10.0,             # reward per newly-seen obstacle cell fraction (if you use delta form)
-        "coverage_completion_threshold": 0.90,
+        "coverage_completion_threshold": 0.20,
         "completion_bonus": 500.0,
 
         # safety / shaping

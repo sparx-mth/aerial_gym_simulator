@@ -10,3 +10,7 @@ nn/
 
 train_dir/
 .history/
+.vscode/
+.idea/
+aerial_gym/rl_training/rl_games/custom_slam_experiment/runs/
+aerial_gym/rl_training/rl_games/custom_slam_experiment/asset_manager/*
